@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GRID BOT — WEB UI</title>
+    <style>
+        body { background:#0e1117; color:#eaeaea; font-family:Arial; }
+        .box { background:#161b22; padding:15px; margin:15px; border-radius:8px; }
+    </style>
+</head>
+<body>
+
+<div class="box">
+    <h2>📊 Общая статистика</h2>
+    Equity: {{ data.equity }}$<br>
+    Total PnL: {{ data.total_pnl }}$<br>
+    Deals: {{ data.deals }}<br>
+    Uptime: {{ data.uptime_min }} min
+</div>
+
+<div class="box">
+    <h2>📈 Статистика по парам</h2>
+    {% for pair, s in data.pair_stats.items() %}
+        <b>{{ pair }}</b> — Deals {{ s.deals }}, PnL {{ s.pnl }}$, Avg {{ s.avg }}$<br>
+    {% endfor %}
+</div>
+
+</body>
+</html>

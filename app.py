@@ -10,24 +10,28 @@ import uvicorn
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TIMEFRAME = "15m"
 
+# 🔥 ДОБАВИЛИ ДЕШЕВЫЕ ПАРЫ
 ALL_PAIRS = [
     "SOLUSDT", "BNBUSDT",
     "DOGEUSDT", "TRXUSDT",
     "ADAUSDT", "XRPUSDT",
     "TONUSDT", "ARBUSDT",
-    "OPUSDT"
+    "OPUSDT",
+    "PEPEUSDT", "SHIBUSDT",
+    "FLOKIUSDT", "BONKUSDT",
+    "1000SATSUSDT", "WIFUSDT"
 ]
 
 AUTO_MODE = True
-MAX_AUTO_PAIRS = 4
+MAX_AUTO_PAIRS = 6        # 🔥 было 4
 
 DEPOSIT = 100.0
 LEVERAGE = 10
 MAX_GRIDS = 2
-MAX_MARGIN_PER_GRID = 0.10
+MAX_MARGIN_PER_GRID = 0.12   # 🔥 было 0.10
 
 ATR_PERIOD = 14
-SCAN_INTERVAL = 20
+SCAN_INTERVAL = 15           # 🔥 быстрее
 
 MAKER_FEE = 0.0002
 TAKER_FEE = 0.0004
@@ -92,20 +96,21 @@ async def auto_select_pairs():
 
         atr_pct = a / price * 100
 
-        if price > 15:
+        # 🔥 РАСШИРЕННЫЙ ФИЛЬТР
+        if price > 20:
             continue
-        if not (0.4 <= atr_pct <= 3.0):
+        if not (0.6 <= atr_pct <= 5.0):
             continue
 
-        scored.append((pair, abs(atr_pct - 1.2)))
+        scored.append((pair, abs(atr_pct - 1.3)))
 
     scored.sort(key=lambda x: x[1])
     STATE["auto_pairs"] = [p for p, _ in scored[:MAX_AUTO_PAIRS]]
 
 # ================== GRID ==================
 def build_grid(price, atr_val):
-    rng = atr_val * 2.5
-    levels = 8
+    rng = atr_val * 1.8     # 🔥 было 2.5
+    levels = 6              # 🔥 было 8
 
     low = price - rng
     high = price + rng
@@ -138,7 +143,7 @@ async def engine_loop():
 
         all_pairs = list(set(STATE["active_pairs"] + STATE["auto_pairs"]))
 
-        # update grids
+        # --- UPDATE GRIDS ---
         for pair, g in list(STATE["active_grids"].items()):
             kl = await get_klines(pair, 2)
             if not kl:
@@ -157,17 +162,20 @@ async def engine_loop():
                     STATE["total_pnl"] += pnl
                     STATE["deals"] += 1
 
-                    ps = STATE["pair_stats"].setdefault(pair, {"pnl": 0.0, "deals": 0})
+                    ps = STATE["pair_stats"].setdefault(pair, {
+                        "pnl": 0.0, "deals": 0
+                    })
                     ps["pnl"] += pnl
                     ps["deals"] += 1
 
                     o["open"] = False
 
-        # start new grids
+        # --- START NEW GRIDS ---
         if len(STATE["active_grids"]) < MAX_GRIDS:
             for pair in all_pairs:
                 if pair in STATE["active_grids"]:
                     continue
+
                 kl = await get_klines(pair)
                 if len(kl) < 50:
                     continue
@@ -206,7 +214,7 @@ def dashboard():
     return f"""
     <html>
     <head>
-        <title>GRID BOT</title>
+        <title>GRID BOT — FIRE</title>
         <style>
             body {{ background:#0f1116; color:#eee; font-family:Arial }}
             table {{ border-collapse:collapse; width:100% }}
@@ -214,7 +222,7 @@ def dashboard():
         </style>
     </head>
     <body>
-        <h2>🤖 GRID BOT — LIVE</h2>
+        <h2>🔥 GRID BOT — LIVE</h2>
         <p>Uptime: {uptime} min</p>
         <p>Equity: {equity:.2f}$ | PnL: {STATE["total_pnl"]:.2f}$</p>
         <p>Deals: {STATE["deals"]}</p>

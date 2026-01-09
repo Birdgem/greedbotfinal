@@ -1,27 +1,43 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>GRID BOT — WEB UI</title>
     <style>
-        body { background:#0e1117; color:#eaeaea; font-family:Arial; }
-        .box { background:#161b22; padding:15px; margin:15px; border-radius:8px; }
+        body { background:#0f1117; color:#eaeaea; font-family:Arial; padding:20px; }
+        .box { background:#161a22; padding:15px; margin-bottom:15px; border-radius:8px; }
+        h2 { margin-top:0; }
     </style>
 </head>
 <body>
 
+<h1>🤖 GRID BOT — WEB UI</h1>
+
 <div class="box">
     <h2>📊 Общая статистика</h2>
-    Equity: {{ data.equity }}$<br>
-    Total PnL: {{ data.total_pnl }}$<br>
+    Equity: {{ data.equity }} $<br>
+    Total PnL: {{ data.total_pnl }} $<br>
     Deals: {{ data.deals }}<br>
     Uptime: {{ data.uptime_min }} min
 </div>
 
 <div class="box">
+    <h2>🎯 Активные пары</h2>
+    Ручные: {{ data.active_pairs | join(", ") }}<br>
+    Авто: {{ data.auto_pairs | join(", ") }}
+</div>
+
+<div class="box">
     <h2>📈 Статистика по парам</h2>
-    {% for pair, s in data.pair_stats.items() %}
-        <b>{{ pair }}</b> — Deals {{ s.deals }}, PnL {{ s.pnl }}$, Avg {{ s.avg }}$<br>
+    {% for pair, s in (data.pair_stats or {}).items() %}
+        <b>{{ pair }}</b> — Deals: {{ s.deals }}, PnL: {{ "%.4f"|format(s.pnl) }}<br>
+    {% else %}
+        нет данных
     {% endfor %}
+</div>
+
+<div style="opacity:0.5;margin-top:20px;">
+    Last update: {{ data.timestamp }}
 </div>
 
 </body>

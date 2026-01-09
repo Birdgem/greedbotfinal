@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Grid Bot</title>
+    <style>
+        body { background:#111; color:#eee; font-family:Arial; padding:20px }
+        pre { background:#1e1e1e; padding:15px }
+    </style>
+</head>
+<body>
+<h2>📊 GRID BOT STATUS</h2>
+<pre id="data">loading...</pre>
+
+<script>
+async function load() {
+    const r = await fetch("/api/state");
+    const j = await r.json();
+    document.getElementById("data").textContent =
+        JSON.stringify(j, null, 2);
+}
+setInterval(load, 5000);
+load();
+</script>
+</body>
+</html>

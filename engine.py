@@ -27,7 +27,7 @@ MAX_AUTO_PAIRS = 6        # 🔥 было 4
 
 DEPOSIT = 100.0
 LEVERAGE = 10
-MAX_GRIDS = 2
+MAX_GRIDS = 3
 MAX_MARGIN_PER_GRID = 0.12   # 🔥 было 0.10
 
 ATR_PERIOD = 14

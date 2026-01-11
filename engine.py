@@ -109,8 +109,8 @@ async def auto_select_pairs():
 
 # ================== GRID ==================
 def build_grid(price, atr_val):
-    rng = atr_val * 1.8     # 🔥 было 2.5
-    levels = 6              # 🔥 было 8
+    rng = atr_val * 2.0     # 🔥 было 2.5
+    levels = 12              # 🔥 было 8
 
     low = price - rng
     high = price + rng

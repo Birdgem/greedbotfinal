@@ -8,7 +8,7 @@ import uvicorn
 
 # ================== CONFIG ==================
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
-TIMEFRAME = "15m"
+TIMEFRAME = "5m"
 
 # 🔥 ДОБАВИЛИ ДЕШЕВЫЕ ПАРЫ
 ALL_PAIRS = [
@@ -109,12 +109,21 @@ async def auto_select_pairs():
 
 # ================== GRID ==================
 def build_grid(price, atr_val):
-    rng = atr_val * 2.0     # 🔥 было 2.5
-    levels = 12              # 🔥 было 8
+    rng = atr_val * 1.6        # уже более агрессивно
+    levels = 16                # плотная сетка
 
     low = price - rng
     high = price + rng
     step = (high - low) / levels
+
+    # 🔥 МИНИМАЛЬНЫЙ ШАГ (в % от цены)
+    min_step_pct = 0.15 / 100   # 0.15%
+    min_step = price * min_step_pct
+
+    if step < min_step:
+        step = min_step
+        low = price - step * levels / 2
+        high = price + step * levels / 2
 
     margin = STATE["deposit"] * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
@@ -126,14 +135,20 @@ def build_grid(price, atr_val):
         exit = entry + step
         if entry * qty < MIN_ORDER_NOTIONAL:
             continue
-        orders.append({"entry": entry, "exit": exit, "qty": qty, "open": False})
+        orders.append({
+            "entry": entry,
+            "exit": exit,
+            "qty": qty,
+            "open": False
+        })
 
-    return {"low": low, "high": high, "orders": orders, "atr": atr_val}
-
-def calc_pnl(entry, exit, qty):
-    gross = (exit - entry) * qty
-    fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
-    return gross - fees
+    return {
+        "low": low,
+        "high": high,
+        "orders": orders,
+        "atr": atr_val,
+        "step": step
+    }
 
 # ================== ENGINE LOOP ==================
 async def engine_loop():

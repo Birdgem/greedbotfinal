@@ -10,7 +10,6 @@ import uvicorn
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TIMEFRAME = "5m"
 
-# 🔥 ДОБАВИЛИ ДЕШЕВЫЕ ПАРЫ
 ALL_PAIRS = [
     "SOLUSDT", "BNBUSDT",
     "DOGEUSDT", "TRXUSDT",
@@ -23,15 +22,15 @@ ALL_PAIRS = [
 ]
 
 AUTO_MODE = True
-MAX_AUTO_PAIRS = 6        # 🔥 было 4
+MAX_AUTO_PAIRS = 6
 
 DEPOSIT = 100.0
 LEVERAGE = 10
 MAX_GRIDS = 3
-MAX_MARGIN_PER_GRID = 0.12   # 🔥 было 0.10
+MAX_MARGIN_PER_GRID = 0.12
 
 ATR_PERIOD = 14
-SCAN_INTERVAL = 15           # 🔥 быстрее
+SCAN_INTERVAL = 15
 
 MAKER_FEE = 0.0002
 TAKER_FEE = 0.0004
@@ -50,13 +49,6 @@ STATE = {
 }
 
 # ================== HELPERS ==================
-def ema(data, p):
-    k = 2 / (p + 1)
-    e = sum(data[:p]) / p
-    for x in data[p:]:
-        e = x * k + e * (1 - k)
-    return e
-
 def atr(highs, lows, closes):
     tr = []
     for i in range(1, len(closes)):
@@ -66,6 +58,13 @@ def atr(highs, lows, closes):
             abs(lows[i] - closes[i-1])
         ))
     return mean(tr[-ATR_PERIOD:]) if len(tr) >= ATR_PERIOD else None
+
+
+def calc_pnl(entry, exit, qty):
+    gross = (exit - entry) * qty
+    fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
+    return gross - fees
+
 
 async def get_klines(symbol, limit=120):
     async with aiohttp.ClientSession() as s:
@@ -96,7 +95,6 @@ async def auto_select_pairs():
 
         atr_pct = a / price * 100
 
-        # 🔥 РАСШИРЕННЫЙ ФИЛЬТР
         if price > 20:
             continue
         if not (0.6 <= atr_pct <= 5.0):
@@ -109,21 +107,19 @@ async def auto_select_pairs():
 
 # ================== GRID ==================
 def build_grid(price, atr_val):
-    rng = atr_val * 1.6        # уже более агрессивно
-    levels = 16                # плотная сетка
+    rng = atr_val * 1.6
+    levels = 16
 
-    low = price - rng
-    high = price + rng
-    step = (high - low) / levels
+    step = (rng * 2) / levels
 
-    # 🔥 МИНИМАЛЬНЫЙ ШАГ (в % от цены)
-    min_step_pct = 0.15 / 100   # 0.15%
+    min_step_pct = 0.15 / 100
     min_step = price * min_step_pct
 
     if step < min_step:
         step = min_step
-        low = price - step * levels / 2
-        high = price + step * levels / 2
+
+    low = price - step * (levels // 2)
+    high = price + step * (levels // 2)
 
     margin = STATE["deposit"] * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
@@ -142,15 +138,17 @@ def build_grid(price, atr_val):
             "open": False
         })
 
+    if not orders:
+        return None
+
     return {
         "low": low,
         "high": high,
         "orders": orders,
-        "atr": atr_val,
         "step": step
     }
 
-# ================== ENGINE LOOP ==================
+# ================== ENGINE ==================
 async def engine_loop():
     while True:
         if AUTO_MODE:
@@ -158,20 +156,22 @@ async def engine_loop():
 
         all_pairs = list(set(STATE["active_pairs"] + STATE["auto_pairs"]))
 
-        # --- UPDATE GRIDS ---
+        # UPDATE GRIDS
         for pair, g in list(STATE["active_grids"].items()):
             kl = await get_klines(pair, 2)
             if not kl:
                 continue
 
             price = float(kl[-1][4])
+
             if not (g["low"] <= price <= g["high"]):
                 del STATE["active_grids"][pair]
                 continue
 
             for o in g["orders"]:
-                if not o["open"] and price <= o["entry"]:
+                if not o["open"] and o["entry"] >= price >= o["entry"] - g["step"]:
                     o["open"] = True
+
                 elif o["open"] and price >= o["exit"]:
                     pnl = calc_pnl(o["entry"], o["exit"], o["qty"])
                     STATE["total_pnl"] += pnl
@@ -185,7 +185,7 @@ async def engine_loop():
 
                     o["open"] = False
 
-        # --- START NEW GRIDS ---
+        # START NEW GRIDS
         if len(STATE["active_grids"]) < MAX_GRIDS:
             for pair in all_pairs:
                 if pair in STATE["active_grids"]:
@@ -203,7 +203,11 @@ async def engine_loop():
                 if not a:
                     continue
 
-                STATE["active_grids"][pair] = build_grid(c[-1], a)
+                grid = build_grid(c[-1], a)
+                if not grid:
+                    continue
+
+                STATE["active_grids"][pair] = grid
                 if len(STATE["active_grids"]) >= MAX_GRIDS:
                     break
 

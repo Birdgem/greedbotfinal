@@ -43,7 +43,7 @@ STATE = {
     "deals": 0,
     "active_pairs": ["SOLUSDT", "BNBUSDT"],
     "auto_pairs": [],
-    "active_grids": {},   # pair -> grid
+    "active_grids": {},
     "pair_stats": {}
 }
 
@@ -94,10 +94,10 @@ async def auto_select_pairs():
 
         if price > 20:
             continue
-        if not (0.5 <= atr_pct <= 5.0):
+        if not (0.5 <= atr_pct <= 6.0):
             continue
 
-        scored.append((pair, abs(atr_pct - 1.5)))
+        scored.append((pair, abs(atr_pct - 1.6)))
 
     scored.sort(key=lambda x: x[1])
     STATE["auto_pairs"] = [p for p, _ in scored[:MAX_AUTO_PAIRS]]
@@ -105,20 +105,31 @@ async def auto_select_pairs():
 # ================== GRID ==================
 def adaptive_step(price, atr_pct):
     if atr_pct < 1.0:
-        return price * 0.0012   # 0.12%
+        return price * 0.0009   # 🔥 плотнее
     elif atr_pct < 2.0:
-        return price * 0.0020   # 0.20%
+        return price * 0.0016
     else:
-        return price * 0.0035   # 0.35%
+        return price * 0.0030
 
 def build_neutral_grid(price, atr_val):
     atr_pct = atr_val / price * 100
     step = adaptive_step(price, atr_pct)
-    levels = 20
+
+    # 🔥 ДИНАМИЧЕСКАЯ ПЛОТНОСТЬ
+    if price < 0.01:
+        levels = 60
+    elif price < 0.1:
+        levels = 40
+    else:
+        levels = 20
 
     margin = STATE["deposit"] * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
     qty = (notional / price) / levels
+
+    # 🔥 ДОЖИМАЕМ MIN NOTIONAL
+    if price * qty < MIN_ORDER_NOTIONAL:
+        qty = MIN_ORDER_NOTIONAL / price
 
     long_orders = []
     short_orders = []
@@ -130,23 +141,21 @@ def build_neutral_grid(price, atr_val):
         short_entry = price + step * i
         short_exit = short_entry - step
 
-        if long_entry * qty >= MIN_ORDER_NOTIONAL:
-            long_orders.append({
-                "side": "long",
-                "entry": long_entry,
-                "exit": long_exit,
-                "qty": qty,
-                "open": False
-            })
+        long_orders.append({
+            "side": "long",
+            "entry": long_entry,
+            "exit": long_exit,
+            "qty": qty,
+            "open": False
+        })
 
-        if short_entry * qty >= MIN_ORDER_NOTIONAL:
-            short_orders.append({
-                "side": "short",
-                "entry": short_entry,
-                "exit": short_exit,
-                "qty": qty,
-                "open": False
-            })
+        short_orders.append({
+            "side": "short",
+            "entry": short_entry,
+            "exit": short_exit,
+            "qty": qty,
+            "open": False
+        })
 
     return {
         "longs": long_orders,
@@ -163,7 +172,6 @@ async def engine_loop():
 
         all_pairs = list(set(STATE["active_pairs"] + STATE["auto_pairs"]))
 
-        # === UPDATE GRIDS ===
         for pair, g in list(STATE["active_grids"].items()):
             kl = await get_klines(pair, 2)
             if not kl:
@@ -194,7 +202,6 @@ async def engine_loop():
 
                     o["open"] = False
 
-        # === START NEW GRIDS ===
         if len(STATE["active_grids"]) < MAX_GRIDS:
             for pair in all_pairs:
                 if pair in STATE["active_grids"]:
@@ -237,26 +244,13 @@ def dashboard():
 
     return f"""
     <html>
-    <head>
-        <title>GRID BOT — NEUTRAL</title>
-        <style>
-            body {{ background:#0f1116; color:#eee; font-family:Arial }}
-            table {{ border-collapse:collapse; width:100% }}
-            td,th {{ border:1px solid #333; padding:6px }}
-        </style>
-    </head>
-    <body>
-        <h2>🔥 GRID BOT — LONG + SHORT</h2>
+    <body style="background:#0f1116;color:#eee;font-family:Arial">
+        <h2>🔥 GRID BOT — MEME MODE</h2>
         <p>Uptime: {uptime} min</p>
         <p>Equity: {equity:.2f}$ | PnL: {STATE["total_pnl"]:.2f}$</p>
         <p>Deals: {STATE["deals"]}</p>
-
-        <h3>Активные пары</h3>
-        <p>Ручные: {", ".join(STATE["active_pairs"])}</p>
-        <p>Авто: {", ".join(STATE["auto_pairs"])}</p>
-
-        <h3>Статистика по парам</h3>
-        <table>
+        <p>Pairs: {", ".join(STATE["auto_pairs"])}</p>
+        <table border=1 cellpadding=5>
             <tr><th>Pair</th><th>Deals</th><th>PnL</th><th>Avg</th></tr>
             {rows or "<tr><td colspan=4>нет данных</td></tr>"}
         </table>

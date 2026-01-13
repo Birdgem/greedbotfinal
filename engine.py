@@ -15,9 +15,8 @@ ALL_PAIRS = [
     "DOGEUSDT", "TRXUSDT",
     "ADAUSDT", "XRPUSDT",
     "TONUSDT", "ARBUSDT",
-    "OPUSDT",
-    "PEPEUSDT", "SHIBUSDT",
-    "FLOKIUSDT", "BONKUSDT",
+    "OPUSDT", "PEPEUSDT",
+    "BONKUSDT", "FLOKIUSDT",
     "1000SATSUSDT", "WIFUSDT"
 ]
 
@@ -44,7 +43,7 @@ STATE = {
     "deals": 0,
     "active_pairs": ["SOLUSDT", "BNBUSDT"],
     "auto_pairs": [],
-    "active_grids": {},
+    "active_grids": {},   # pair -> grid
     "pair_stats": {}
 }
 
@@ -59,13 +58,6 @@ def atr(highs, lows, closes):
         ))
     return mean(tr[-ATR_PERIOD:]) if len(tr) >= ATR_PERIOD else None
 
-
-def calc_pnl(entry, exit, qty):
-    gross = (exit - entry) * qty
-    fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
-    return gross - fees
-
-
 async def get_klines(symbol, limit=120):
     async with aiohttp.ClientSession() as s:
         async with s.get(
@@ -74,6 +66,11 @@ async def get_klines(symbol, limit=120):
         ) as r:
             d = await r.json()
             return d if isinstance(d, list) else []
+
+def calc_pnl(entry, exit, qty):
+    gross = (exit - entry) * qty
+    fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
+    return gross - fees
 
 # ================== AUTO SELECT ==================
 async def auto_select_pairs():
@@ -97,55 +94,65 @@ async def auto_select_pairs():
 
         if price > 20:
             continue
-        if not (0.6 <= atr_pct <= 5.0):
+        if not (0.5 <= atr_pct <= 5.0):
             continue
 
-        scored.append((pair, abs(atr_pct - 1.3)))
+        scored.append((pair, abs(atr_pct - 1.5)))
 
     scored.sort(key=lambda x: x[1])
     STATE["auto_pairs"] = [p for p, _ in scored[:MAX_AUTO_PAIRS]]
 
 # ================== GRID ==================
-def build_grid(price, atr_val):
-    rng = atr_val * 1.6
-    levels = 16
+def adaptive_step(price, atr_pct):
+    if atr_pct < 1.0:
+        return price * 0.0012   # 0.12%
+    elif atr_pct < 2.0:
+        return price * 0.0020   # 0.20%
+    else:
+        return price * 0.0035   # 0.35%
 
-    step = (rng * 2) / levels
-
-    min_step_pct = 0.15 / 100
-    min_step = price * min_step_pct
-
-    if step < min_step:
-        step = min_step
-
-    low = price - step * (levels // 2)
-    high = price + step * (levels // 2)
+def build_neutral_grid(price, atr_val):
+    atr_pct = atr_val / price * 100
+    step = adaptive_step(price, atr_pct)
+    levels = 20
 
     margin = STATE["deposit"] * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
     qty = (notional / price) / levels
 
-    orders = []
-    for i in range(levels):
-        entry = low + step * i
-        exit = entry + step
-        if entry * qty < MIN_ORDER_NOTIONAL:
-            continue
-        orders.append({
-            "entry": entry,
-            "exit": exit,
-            "qty": qty,
-            "open": False
-        })
+    long_orders = []
+    short_orders = []
 
-    if not orders:
-        return None
+    for i in range(1, levels + 1):
+        long_entry = price - step * i
+        long_exit = long_entry + step
+
+        short_entry = price + step * i
+        short_exit = short_entry - step
+
+        if long_entry * qty >= MIN_ORDER_NOTIONAL:
+            long_orders.append({
+                "side": "long",
+                "entry": long_entry,
+                "exit": long_exit,
+                "qty": qty,
+                "open": False
+            })
+
+        if short_entry * qty >= MIN_ORDER_NOTIONAL:
+            short_orders.append({
+                "side": "short",
+                "entry": short_entry,
+                "exit": short_exit,
+                "qty": qty,
+                "open": False
+            })
 
     return {
-        "low": low,
-        "high": high,
-        "orders": orders,
-        "step": step
+        "longs": long_orders,
+        "shorts": short_orders,
+        "step": step,
+        "atr_pct": atr_pct
     }
 
 # ================== ENGINE ==================
@@ -156,7 +163,7 @@ async def engine_loop():
 
         all_pairs = list(set(STATE["active_pairs"] + STATE["auto_pairs"]))
 
-        # UPDATE GRIDS
+        # === UPDATE GRIDS ===
         for pair, g in list(STATE["active_grids"].items()):
             kl = await get_klines(pair, 2)
             if not kl:
@@ -164,28 +171,30 @@ async def engine_loop():
 
             price = float(kl[-1][4])
 
-            if not (g["low"] <= price <= g["high"]):
-                del STATE["active_grids"][pair]
-                continue
+            for o in g["longs"] + g["shorts"]:
+                if not o["open"]:
+                    if o["side"] == "long" and price <= o["entry"]:
+                        o["open"] = True
+                    elif o["side"] == "short" and price >= o["entry"]:
+                        o["open"] = True
+                else:
+                    if o["side"] == "long" and price >= o["exit"]:
+                        pnl = calc_pnl(o["entry"], o["exit"], o["qty"])
+                    elif o["side"] == "short" and price <= o["exit"]:
+                        pnl = calc_pnl(o["exit"], o["entry"], o["qty"])
+                    else:
+                        continue
 
-            for o in g["orders"]:
-                if not o["open"] and o["entry"] >= price >= o["entry"] - g["step"]:
-                    o["open"] = True
-
-                elif o["open"] and price >= o["exit"]:
-                    pnl = calc_pnl(o["entry"], o["exit"], o["qty"])
                     STATE["total_pnl"] += pnl
                     STATE["deals"] += 1
 
-                    ps = STATE["pair_stats"].setdefault(pair, {
-                        "pnl": 0.0, "deals": 0
-                    })
+                    ps = STATE["pair_stats"].setdefault(pair, {"pnl": 0.0, "deals": 0})
                     ps["pnl"] += pnl
                     ps["deals"] += 1
 
                     o["open"] = False
 
-        # START NEW GRIDS
+        # === START NEW GRIDS ===
         if len(STATE["active_grids"]) < MAX_GRIDS:
             for pair in all_pairs:
                 if pair in STATE["active_grids"]:
@@ -203,11 +212,7 @@ async def engine_loop():
                 if not a:
                     continue
 
-                grid = build_grid(c[-1], a)
-                if not grid:
-                    continue
-
-                STATE["active_grids"][pair] = grid
+                STATE["active_grids"][pair] = build_neutral_grid(c[-1], a)
                 if len(STATE["active_grids"]) >= MAX_GRIDS:
                     break
 
@@ -233,7 +238,7 @@ def dashboard():
     return f"""
     <html>
     <head>
-        <title>GRID BOT — FIRE</title>
+        <title>GRID BOT — NEUTRAL</title>
         <style>
             body {{ background:#0f1116; color:#eee; font-family:Arial }}
             table {{ border-collapse:collapse; width:100% }}
@@ -241,7 +246,7 @@ def dashboard():
         </style>
     </head>
     <body>
-        <h2>🔥 GRID BOT — LIVE</h2>
+        <h2>🔥 GRID BOT — LONG + SHORT</h2>
         <p>Uptime: {uptime} min</p>
         <p>Equity: {equity:.2f}$ | PnL: {STATE["total_pnl"]:.2f}$</p>
         <p>Deals: {STATE["deals"]}</p>

@@ -48,6 +48,13 @@ STATE = {
 }
 
 # ================== HELPERS ==================
+def ema(data, period):
+    k = 2 / (period + 1)
+    e = sum(data[:period]) / period
+    for x in data[period:]:
+        e = x * k + e * (1 - k)
+    return e
+
 def atr(highs, lows, closes):
     tr = []
     for i in range(1, len(closes)):
@@ -78,7 +85,7 @@ async def auto_select_pairs():
 
     for pair in ALL_PAIRS:
         kl = await get_klines(pair)
-        if len(kl) < 50:
+        if len(kl) < 60:
             continue
 
         c = [float(k[4]) for k in kl]
@@ -94,10 +101,10 @@ async def auto_select_pairs():
 
         if price > 20:
             continue
-        if not (0.5 <= atr_pct <= 6.0):
+        if not (0.5 <= atr_pct <= 5.0):
             continue
 
-        scored.append((pair, abs(atr_pct - 1.6)))
+        scored.append((pair, abs(atr_pct - 1.5)))
 
     scored.sort(key=lambda x: x[1])
     STATE["auto_pairs"] = [p for p, _ in scored[:MAX_AUTO_PAIRS]]
@@ -105,63 +112,57 @@ async def auto_select_pairs():
 # ================== GRID ==================
 def adaptive_step(price, atr_pct):
     if atr_pct < 1.0:
-        return price * 0.0009   # 🔥 плотнее
+        return price * 0.0012
     elif atr_pct < 2.0:
-        return price * 0.0016
+        return price * 0.0020
     else:
-        return price * 0.0030
+        return price * 0.0035
 
-def build_neutral_grid(price, atr_val):
+def build_neutral_grid(price, center, atr_val, trend):
     atr_pct = atr_val / price * 100
     step = adaptive_step(price, atr_pct)
-
-    # 🔥 ДИНАМИЧЕСКАЯ ПЛОТНОСТЬ
-    if price < 0.01:
-        levels = 60
-    elif price < 0.1:
-        levels = 40
-    else:
-        levels = 20
+    levels = 20
 
     margin = STATE["deposit"] * MAX_MARGIN_PER_GRID
     notional = margin * LEVERAGE
     qty = (notional / price) / levels
 
-    # 🔥 ДОЖИМАЕМ MIN NOTIONAL
-    if price * qty < MIN_ORDER_NOTIONAL:
-        qty = MIN_ORDER_NOTIONAL / price
-
-    long_orders = []
-    short_orders = []
+    longs, shorts = [], []
 
     for i in range(1, levels + 1):
-        long_entry = price - step * i
+        long_entry = center - step * i
         long_exit = long_entry + step
 
-        short_entry = price + step * i
+        short_entry = center + step * i
         short_exit = short_entry - step
 
-        long_orders.append({
-            "side": "long",
-            "entry": long_entry,
-            "exit": long_exit,
-            "qty": qty,
-            "open": False
-        })
+        # EMA trend filter
+        allow_long = trend != "down"
+        allow_short = trend != "up"
 
-        short_orders.append({
-            "side": "short",
-            "entry": short_entry,
-            "exit": short_exit,
-            "qty": qty,
-            "open": False
-        })
+        if allow_long and long_entry * qty >= MIN_ORDER_NOTIONAL:
+            longs.append({
+                "side": "long",
+                "entry": long_entry,
+                "exit": long_exit,
+                "qty": qty,
+                "open": False
+            })
+
+        if allow_short and short_entry * qty >= MIN_ORDER_NOTIONAL:
+            shorts.append({
+                "side": "short",
+                "entry": short_entry,
+                "exit": short_exit,
+                "qty": qty,
+                "open": False
+            })
 
     return {
-        "longs": long_orders,
-        "shorts": short_orders,
+        "center": center,
         "step": step,
-        "atr_pct": atr_pct
+        "longs": longs,
+        "shorts": shorts
     }
 
 # ================== ENGINE ==================
@@ -172,12 +173,29 @@ async def engine_loop():
 
         all_pairs = list(set(STATE["active_pairs"] + STATE["auto_pairs"]))
 
+        # === UPDATE GRIDS ===
         for pair, g in list(STATE["active_grids"].items()):
-            kl = await get_klines(pair, 2)
+            kl = await get_klines(pair, 60)
             if not kl:
                 continue
 
-            price = float(kl[-1][4])
+            closes = [float(k[4]) for k in kl]
+            price = closes[-1]
+
+            ema21 = ema(closes, 21)
+            ema50 = ema(closes, 50)
+            ema200 = ema(closes, 200)
+
+            trend = "flat"
+            if ema50 > ema200:
+                trend = "up"
+            elif ema50 < ema200:
+                trend = "down"
+
+            # 🔥 ПЛАВАЮЩИЙ ЦЕНТР
+            if abs(price - g["center"]) > g["step"] * 3:
+                del STATE["active_grids"][pair]
+                continue
 
             for o in g["longs"] + g["shorts"]:
                 if not o["open"]:
@@ -202,24 +220,39 @@ async def engine_loop():
 
                     o["open"] = False
 
+        # === START NEW GRIDS ===
         if len(STATE["active_grids"]) < MAX_GRIDS:
             for pair in all_pairs:
                 if pair in STATE["active_grids"]:
                     continue
 
-                kl = await get_klines(pair)
-                if len(kl) < 50:
+                kl = await get_klines(pair, 120)
+                if len(kl) < 60:
                     continue
 
-                c = [float(k[4]) for k in kl]
-                h = [float(k[2]) for k in kl]
-                l = [float(k[3]) for k in kl]
+                closes = [float(k[4]) for k in kl]
+                highs = [float(k[2]) for k in kl]
+                lows = [float(k[3]) for k in kl]
 
-                a = atr(h, l, c)
+                price = closes[-1]
+                a = atr(highs, lows, closes)
                 if not a:
                     continue
 
-                STATE["active_grids"][pair] = build_neutral_grid(c[-1], a)
+                ema21 = ema(closes, 21)
+                ema50 = ema(closes, 50)
+                ema200 = ema(closes, 200)
+
+                trend = "flat"
+                if ema50 > ema200:
+                    trend = "up"
+                elif ema50 < ema200:
+                    trend = "down"
+
+                STATE["active_grids"][pair] = build_neutral_grid(
+                    price, ema21, a, trend
+                )
+
                 if len(STATE["active_grids"]) >= MAX_GRIDS:
                     break
 
@@ -244,13 +277,26 @@ def dashboard():
 
     return f"""
     <html>
-    <body style="background:#0f1116;color:#eee;font-family:Arial">
-        <h2>🔥 GRID BOT — MEME MODE</h2>
+    <head>
+        <title>GRID BOT — KILLER</title>
+        <style>
+            body {{ background:#0f1116; color:#eee; font-family:Arial }}
+            table {{ border-collapse:collapse; width:100% }}
+            td,th {{ border:1px solid #333; padding:6px }}
+        </style>
+    </head>
+    <body>
+        <h2>🔥 GRID BOT — KILLER MODE</h2>
         <p>Uptime: {uptime} min</p>
         <p>Equity: {equity:.2f}$ | PnL: {STATE["total_pnl"]:.2f}$</p>
         <p>Deals: {STATE["deals"]}</p>
-        <p>Pairs: {", ".join(STATE["auto_pairs"])}</p>
-        <table border=1 cellpadding=5>
+
+        <h3>Активные пары</h3>
+        <p>Ручные: {", ".join(STATE["active_pairs"])}</p>
+        <p>Авто: {", ".join(STATE["auto_pairs"])}</p>
+
+        <h3>Статистика по парам</h3>
+        <table>
             <tr><th>Pair</th><th>Deals</th><th>PnL</th><th>Avg</th></tr>
             {rows or "<tr><td colspan=4>нет данных</td></tr>"}
         </table>

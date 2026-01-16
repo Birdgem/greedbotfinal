@@ -1,152 +1,140 @@
-import asyncio
 import time
-import aiohttp
 import hmac
 import hashlib
-import urllib.parse
-import os
+import requests
+import asyncio
 import socket
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
 
 # ================= CONFIG =================
-BINANCE_URL = "https://fapi.binance.com"
-PAIR = "PEPEUSDT"
+SYMBOL = "PEPEUSDT"
+BASE_URL = "https://fapi.binance.com"
 
+ORDER_NOTIONAL = 5.0      # SAFE MODE
+TP_PCT = 0.003            # 0.3%
+SL_PCT = 0.003
+
+# ================= API =================
+import os
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-
-DEPOSIT = 5.0
-LEVERAGE = 5
-STEP_PCT = 0.002        # 0.2%
-SCAN_INTERVAL = 5
-
-MIN_NOTIONAL = 5.0
 
 # ================= STATE =================
 STATE = {
     "start_ts": time.time(),
     "running": False,
-    "live": False,
-    "deals": 0,
-    "center": None,
+    "live": True,
+    "position": None,
+    "center_price": None,
     "last_price": None,
+    "deals": [],
 }
 
 # ================= HELPERS =================
-def server_ip():
-    try:
-        return socket.gethostbyname(socket.gethostname())
-    except:
-        return "unknown"
+def get_ip():
+    return socket.gethostbyname(socket.gethostname())
 
-def sign(params):
-    query = urllib.parse.urlencode(params)
-    return hmac.new(
-        API_SECRET.encode(),
-        query.encode(),
-        hashlib.sha256
-    ).hexdigest()
+def sign(params: dict):
+    query = "&".join([f"{k}={v}" for k, v in params.items()])
+    signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return query + "&signature=" + signature
 
-async def get_price():
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+def headers():
+    return {"X-MBX-APIKEY": API_KEY}
 
-    urls = [
-        "https://fapi.binance.com/fapi/v1/ticker/price",
-        "https://api.binance.com/api/v3/ticker/price"
-    ]
+def get_price():
+    r = requests.get(f"{BASE_URL}/fapi/v1/ticker/price", params={"symbol": SYMBOL})
+    return float(r.json()["price"])
 
-    async with aiohttp.ClientSession(headers=headers) as s:
-        for url in urls:
-            try:
-                async with s.get(url, params={"symbol": PAIR}, timeout=5) as r:
-                    data = await r.json()
-                    if "price" in data:
-                        return float(data["price"])
-            except Exception as e:
-                print("PRICE ERROR:", e)
-
-    return None
-
-async def place_order(side, qty):
-    if not STATE["live"]:
-        return
-
-    ts = int(time.time() * 1000)
+def place_order(side, qty):
     params = {
-        "symbol": PAIR,
+        "symbol": SYMBOL,
         "side": side,
         "type": "MARKET",
-        "quantity": round(qty, 3),
-        "timestamp": ts
+        "quantity": round(qty, 0),
+        "timestamp": int(time.time() * 1000)
     }
-    params["signature"] = sign(params)
-    headers = {"X-MBX-APIKEY": API_KEY}
-
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"{BINANCE_URL}/fapi/v1/order",
-            params=params,
-            headers=headers
-        ) as r:
-            await r.json()
+    q = sign(params)
+    r = requests.post(f"{BASE_URL}/fapi/v1/order?{q}", headers=headers())
+    return r.json()
 
 # ================= ENGINE =================
-async def grid_loop():
+async def engine():
     while True:
-        if not STATE["running"]:
-            await asyncio.sleep(1)
+        if not STATE["running"] or not STATE["live"]:
+            await asyncio.sleep(2)
             continue
 
-        price = await get_price()
+        price = get_price()
         STATE["last_price"] = price
 
-        if STATE["center"] is None:
-            STATE["center"] = price
-            await asyncio.sleep(SCAN_INTERVAL)
+        if STATE["center_price"] is None:
+            STATE["center_price"] = price
+            await asyncio.sleep(2)
             continue
 
-        step = STATE["center"] * STEP_PCT
-        notional = DEPOSIT * LEVERAGE
-        qty = notional / price
+        qty = ORDER_NOTIONAL / price
 
-        if qty * price < MIN_NOTIONAL:
-            await asyncio.sleep(SCAN_INTERVAL)
-            continue
+        # NO POSITION
+        if STATE["position"] is None:
+            if price < STATE["center_price"] * (1 - 0.001):
+                r = place_order("BUY", qty)
+                STATE["position"] = {
+                    "side": "LONG",
+                    "entry": price,
+                    "tp": price * (1 + TP_PCT),
+                    "sl": price * (1 - SL_PCT)
+                }
+                STATE["deals"].append(f"OPEN LONG @ {price:.8f}")
 
-        # BUY below center
-        if price <= STATE["center"] - step:
-            await place_order("BUY", qty)
-            STATE["center"] = price
-            STATE["deals"] += 1
+            elif price > STATE["center_price"] * (1 + 0.001):
+                r = place_order("SELL", qty)
+                STATE["position"] = {
+                    "side": "SHORT",
+                    "entry": price,
+                    "tp": price * (1 - TP_PCT),
+                    "sl": price * (1 + SL_PCT)
+                }
+                STATE["deals"].append(f"OPEN SHORT @ {price:.8f}")
 
-        # SELL above center
-        elif price >= STATE["center"] + step:
-            await place_order("SELL", qty)
-            STATE["center"] = price
-            STATE["deals"] += 1
+        # MANAGE POSITION
+        else:
+            pos = STATE["position"]
 
-        await asyncio.sleep(SCAN_INTERVAL)
+            if pos["side"] == "LONG":
+                if price >= pos["tp"] or price <= pos["sl"]:
+                    place_order("SELL", qty)
+                    STATE["deals"].append(f"CLOSE LONG @ {price:.8f}")
+                    STATE["position"] = None
+                    STATE["center_price"] = price
+
+            if pos["side"] == "SHORT":
+                if price <= pos["tp"] or price >= pos["sl"]:
+                    place_order("BUY", qty)
+                    STATE["deals"].append(f"CLOSE SHORT @ {price:.8f}")
+                    STATE["position"] = None
+                    STATE["center_price"] = price
+
+        await asyncio.sleep(2)
 
 # ================= WEB =================
 app = FastAPI()
 
 @app.on_event("startup")
-async def startup():
-    asyncio.create_task(grid_loop())
+async def start():
+    asyncio.create_task(engine())
 
 @app.post("/start")
-def start():
+def start_bot():
     STATE["running"] = True
-    return {"running": True}
+    return {"status": "started"}
 
 @app.post("/stop")
-def stop():
+def stop_bot():
     STATE["running"] = False
-    return {"running": False}
+    return {"status": "stopped"}
 
 @app.post("/live")
 def toggle_live():
@@ -156,29 +144,27 @@ def toggle_live():
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     uptime = int((time.time() - STATE["start_ts"]) / 60)
+    logs = "<br>".join(STATE["deals"][-20:])
+
     return f"""
     <html>
-    <head>
-        <title>GRID BOT — LIVE SAFE MODE</title>
-        <style>
-            body {{ background:#0f1116; color:#eee; font-family:Arial }}
-            button {{ padding:10px; margin:5px; font-size:16px }}
-        </style>
-    </head>
-    <body>
-        <h2>🔥 GRID BOT — LIVE SAFE MODE</h2>
-        <p><b>IP (add to Binance whitelist):</b> {server_ip()}</p>
-        <p>Uptime: {uptime} min</p>
-        <p>Deposit: ${DEPOSIT}</p>
-        <p>Deals: {STATE["deals"]}</p>
-        <p>RUNNING: {STATE["running"]}</p>
-        <p>LIVE: {STATE["live"]}</p>
-        <p>Center price: {STATE["center"]}</p>
-        <p>Last price: {STATE["last_price"]}</p>
+    <body style="background:#0f1116;color:#eee;font-family:Arial">
+    <h2>🔥 GRID BOT — LIVE SAFE MODE</h2>
 
-        <form action="/start" method="post"><button>START</button></form>
-        <form action="/stop" method="post"><button>STOP</button></form>
-        <form action="/live" method="post"><button>LIVE ON / OFF</button></form>
+    <p><b>IP (add to Binance whitelist):</b> {get_ip()}</p>
+    <p>Uptime: {uptime} min</p>
+    <p>Deposit: {ORDER_NOTIONAL}$</p>
+    <p>RUNNING: {STATE["running"]}</p>
+    <p>LIVE: {STATE["live"]}</p>
+    <p>Center price: {STATE["center_price"]}</p>
+    <p>Last price: {STATE["last_price"]}</p>
+
+    <form action="/start" method="post"><button>START</button></form>
+    <form action="/stop" method="post"><button>STOP</button></form>
+    <form action="/live" method="post"><button>LIVE ON / OFF</button></form>
+
+    <h3>Deal log</h3>
+    <div style="font-size:14px">{logs}</div>
     </body>
     </html>
     """

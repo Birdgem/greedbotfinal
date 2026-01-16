@@ -6,37 +6,32 @@ import hashlib
 import urllib.parse
 import os
 import socket
-from statistics import mean
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
 
 # ================= CONFIG =================
 BINANCE_URL = "https://fapi.binance.com"
-TIMEFRAME = "5m"
+PAIR = "PEPEUSDT"
 
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-PAIR = "PEPEUSDT"        # 🔥 стартуем с одного мема
-DEPOSIT = 5.0            # 🔥 ЖЁСТКИЙ ЛИМИТ
+DEPOSIT = 5.0
 LEVERAGE = 5
-GRID_LEVELS = 6
-SCAN_INTERVAL = 10
+STEP_PCT = 0.002        # 0.2%
+SCAN_INTERVAL = 5
 
 MIN_NOTIONAL = 5.0
-MAKER_FEE = 0.0002
-TAKER_FEE = 0.0004
 
 # ================= STATE =================
 STATE = {
     "start_ts": time.time(),
     "running": False,
     "live": False,
-    "deposit": DEPOSIT,
     "deals": 0,
+    "center": None,
     "last_price": None,
-    "orders": [],
 }
 
 # ================= HELPERS =================
@@ -65,7 +60,7 @@ async def get_price():
 
 async def place_order(side, qty):
     if not STATE["live"]:
-        return {"status": "SIMULATED"}
+        return
 
     ts = int(time.time() * 1000)
     params = {
@@ -84,9 +79,9 @@ async def place_order(side, qty):
             params=params,
             headers=headers
         ) as r:
-            return await r.json()
+            await r.json()
 
-# ================= GRID =================
+# ================= ENGINE =================
 async def grid_loop():
     while True:
         if not STATE["running"]:
@@ -96,31 +91,30 @@ async def grid_loop():
         price = await get_price()
         STATE["last_price"] = price
 
-        step = price * 0.002   # ~0.2%
-        notional = STATE["deposit"] * LEVERAGE
-        qty = notional / price / GRID_LEVELS
+        if STATE["center"] is None:
+            STATE["center"] = price
+            await asyncio.sleep(SCAN_INTERVAL)
+            continue
+
+        step = STATE["center"] * STEP_PCT
+        notional = DEPOSIT * LEVERAGE
+        qty = notional / price
 
         if qty * price < MIN_NOTIONAL:
             await asyncio.sleep(SCAN_INTERVAL)
             continue
 
-        for i in range(1, GRID_LEVELS + 1):
-            buy_price = price - step * i
-            sell_price = price + step * i
+        # BUY below center
+        if price <= STATE["center"] - step:
+            await place_order("BUY", qty)
+            STATE["center"] = price
+            STATE["deals"] += 1
 
-            # BUY
-            if price <= buy_price:
-                await place_order("BUY", qty)
-                await place_order("SELL", qty)
-                STATE["deals"] += 1
-                break
-
-            # SELL
-            if price >= sell_price:
-                await place_order("SELL", qty)
-                await place_order("BUY", qty)
-                STATE["deals"] += 1
-                break
+        # SELL above center
+        elif price >= STATE["center"] + step:
+            await place_order("SELL", qty)
+            STATE["center"] = price
+            STATE["deals"] += 1
 
         await asyncio.sleep(SCAN_INTERVAL)
 
@@ -162,10 +156,11 @@ def dashboard():
         <h2>🔥 GRID BOT — LIVE SAFE MODE</h2>
         <p><b>IP (add to Binance whitelist):</b> {server_ip()}</p>
         <p>Uptime: {uptime} min</p>
-        <p>Deposit: ${STATE["deposit"]}</p>
+        <p>Deposit: ${DEPOSIT}</p>
         <p>Deals: {STATE["deals"]}</p>
         <p>RUNNING: {STATE["running"]}</p>
         <p>LIVE: {STATE["live"]}</p>
+        <p>Center price: {STATE["center"]}</p>
         <p>Last price: {STATE["last_price"]}</p>
 
         <form action="/start" method="post"><button>START</button></form>

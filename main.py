@@ -50,13 +50,26 @@ def sign(params):
     ).hexdigest()
 
 async def get_price():
-    async with aiohttp.ClientSession() as s:
-        async with s.get(
-            f"{BINANCE_URL}/fapi/v1/ticker/price",
-            params={"symbol": PAIR}
-        ) as r:
-            data = await r.json()
-            return float(data["price"])
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    urls = [
+        "https://fapi.binance.com/fapi/v1/ticker/price",
+        "https://api.binance.com/api/v3/ticker/price"
+    ]
+
+    async with aiohttp.ClientSession(headers=headers) as s:
+        for url in urls:
+            try:
+                async with s.get(url, params={"symbol": PAIR}, timeout=5) as r:
+                    data = await r.json()
+                    if "price" in data:
+                        return float(data["price"])
+            except Exception as e:
+                print("PRICE ERROR:", e)
+
+    return None
 
 async def place_order(side, qty):
     if not STATE["live"]:

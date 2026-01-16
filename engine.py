@@ -2,8 +2,8 @@ import asyncio
 import time
 import aiohttp
 from statistics import mean
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 import uvicorn
 
 # ================== CONFIG ==================
@@ -11,19 +11,15 @@ BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TIMEFRAME = "5m"
 
 ALL_PAIRS = [
-    "SOLUSDT", "BNBUSDT",
-    "DOGEUSDT", "TRXUSDT",
-    "ADAUSDT", "XRPUSDT",
-    "TONUSDT", "ARBUSDT",
-    "OPUSDT", "PEPEUSDT",
-    "BONKUSDT", "FLOKIUSDT",
+    "SOLUSDT", "BNBUSDT", "DOGEUSDT", "TRXUSDT",
+    "ADAUSDT", "XRPUSDT", "TONUSDT", "ARBUSDT",
+    "OPUSDT", "PEPEUSDT", "BONKUSDT", "FLOKIUSDT",
     "1000SATSUSDT", "WIFUSDT"
 ]
 
 AUTO_MODE = True
 MAX_AUTO_PAIRS = 6
 
-DEPOSIT = 100.0
 LEVERAGE = 10
 MAX_GRIDS = 3
 MAX_MARGIN_PER_GRID = 0.12
@@ -38,13 +34,15 @@ MIN_ORDER_NOTIONAL = 5.0
 # ================== STATE ==================
 STATE = {
     "start_ts": time.time(),
-    "deposit": DEPOSIT,
+    "engine_enabled": False,      # 🔘 START / STOP
+    "deposit": 100.0,
     "total_pnl": 0.0,
     "deals": 0,
     "active_pairs": ["SOLUSDT", "BNBUSDT"],
     "auto_pairs": [],
     "active_grids": {},
-    "pair_stats": {}
+    "pair_stats": {},
+    "public_ip": "detecting..."
 }
 
 # ================== HELPERS ==================
@@ -79,6 +77,16 @@ def calc_pnl(entry, exit, qty):
     fees = (entry * qty * MAKER_FEE) + (exit * qty * TAKER_FEE)
     return gross - fees
 
+# ================== PUBLIC IP ==================
+async def fetch_public_ip():
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://api.ipify.org?format=json") as r:
+                data = await r.json()
+                STATE["public_ip"] = data.get("ip", "unknown")
+    except:
+        STATE["public_ip"] = "unavailable"
+
 # ================== AUTO SELECT ==================
 async def auto_select_pairs():
     scored = []
@@ -88,12 +96,12 @@ async def auto_select_pairs():
         if len(kl) < 60:
             continue
 
-        c = [float(k[4]) for k in kl]
-        h = [float(k[2]) for k in kl]
-        l = [float(k[3]) for k in kl]
+        closes = [float(k[4]) for k in kl]
+        highs = [float(k[2]) for k in kl]
+        lows = [float(k[3]) for k in kl]
 
-        price = c[-1]
-        a = atr(h, l, c)
+        price = closes[-1]
+        a = atr(highs, lows, closes)
         if not a:
             continue
 
@@ -118,7 +126,7 @@ def adaptive_step(price, atr_pct):
     else:
         return price * 0.0035
 
-def build_neutral_grid(price, center, atr_val, trend):
+def build_grid(price, center, atr_val, trend):
     atr_pct = atr_val / price * 100
     step = adaptive_step(price, atr_pct)
     levels = 20
@@ -130,50 +138,32 @@ def build_neutral_grid(price, center, atr_val, trend):
     longs, shorts = [], []
 
     for i in range(1, levels + 1):
-        long_entry = center - step * i
-        long_exit = long_entry + step
+        le = center - step * i
+        lx = le + step
 
-        short_entry = center + step * i
-        short_exit = short_entry - step
+        se = center + step * i
+        sx = se - step
 
-        # EMA trend filter
-        allow_long = trend != "down"
-        allow_short = trend != "up"
+        if trend != "down" and le * qty >= MIN_ORDER_NOTIONAL:
+            longs.append({"side": "long", "entry": le, "exit": lx, "qty": qty, "open": False})
 
-        if allow_long and long_entry * qty >= MIN_ORDER_NOTIONAL:
-            longs.append({
-                "side": "long",
-                "entry": long_entry,
-                "exit": long_exit,
-                "qty": qty,
-                "open": False
-            })
+        if trend != "up" and se * qty >= MIN_ORDER_NOTIONAL:
+            shorts.append({"side": "short", "entry": se, "exit": sx, "qty": qty, "open": False})
 
-        if allow_short and short_entry * qty >= MIN_ORDER_NOTIONAL:
-            shorts.append({
-                "side": "short",
-                "entry": short_entry,
-                "exit": short_exit,
-                "qty": qty,
-                "open": False
-            })
-
-    return {
-        "center": center,
-        "step": step,
-        "longs": longs,
-        "shorts": shorts
-    }
+    return {"center": center, "step": step, "longs": longs, "shorts": shorts}
 
 # ================== ENGINE ==================
 async def engine_loop():
     while True:
+        if not STATE["engine_enabled"]:
+            await asyncio.sleep(1)
+            continue
+
         if AUTO_MODE:
             await auto_select_pairs()
 
         all_pairs = list(set(STATE["active_pairs"] + STATE["auto_pairs"]))
 
-        # === UPDATE GRIDS ===
         for pair, g in list(STATE["active_grids"].items()):
             kl = await get_klines(pair, 60)
             if not kl:
@@ -181,21 +171,6 @@ async def engine_loop():
 
             closes = [float(k[4]) for k in kl]
             price = closes[-1]
-
-            ema21 = ema(closes, 21)
-            ema50 = ema(closes, 50)
-            ema200 = ema(closes, 200)
-
-            trend = "flat"
-            if ema50 > ema200:
-                trend = "up"
-            elif ema50 < ema200:
-                trend = "down"
-
-            # 🔥 ПЛАВАЮЩИЙ ЦЕНТР
-            if abs(price - g["center"]) > g["step"] * 3:
-                del STATE["active_grids"][pair]
-                continue
 
             for o in g["longs"] + g["shorts"]:
                 if not o["open"]:
@@ -213,20 +188,17 @@ async def engine_loop():
 
                     STATE["total_pnl"] += pnl
                     STATE["deals"] += 1
-
                     ps = STATE["pair_stats"].setdefault(pair, {"pnl": 0.0, "deals": 0})
                     ps["pnl"] += pnl
                     ps["deals"] += 1
-
                     o["open"] = False
 
-        # === START NEW GRIDS ===
         if len(STATE["active_grids"]) < MAX_GRIDS:
             for pair in all_pairs:
                 if pair in STATE["active_grids"]:
                     continue
 
-                kl = await get_klines(pair, 120)
+                kl = await get_klines(pair)
                 if len(kl) < 60:
                     continue
 
@@ -234,7 +206,6 @@ async def engine_loop():
                 highs = [float(k[2]) for k in kl]
                 lows = [float(k[3]) for k in kl]
 
-                price = closes[-1]
                 a = atr(highs, lows, closes)
                 if not a:
                     continue
@@ -249,10 +220,7 @@ async def engine_loop():
                 elif ema50 < ema200:
                     trend = "down"
 
-                STATE["active_grids"][pair] = build_neutral_grid(
-                    price, ema21, a, trend
-                )
-
+                STATE["active_grids"][pair] = build_grid(closes[-1], ema21, a, trend)
                 if len(STATE["active_grids"]) >= MAX_GRIDS:
                     break
 
@@ -263,7 +231,25 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup():
+    asyncio.create_task(fetch_public_ip())
     asyncio.create_task(engine_loop())
+
+@app.post("/start")
+def start_bot():
+    STATE["engine_enabled"] = True
+    return RedirectResponse("/", status_code=303)
+
+@app.post("/stop")
+def stop_bot():
+    STATE["engine_enabled"] = False
+    STATE["active_grids"].clear()
+    return RedirectResponse("/", status_code=303)
+
+@app.post("/deposit")
+def update_deposit(amount: float = Form(...)):
+    STATE["deposit"] = max(1.0, amount)
+    STATE["active_grids"].clear()
+    return RedirectResponse("/", status_code=303)
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -275,30 +261,45 @@ def dashboard():
         avg = s["pnl"] / s["deals"]
         rows += f"<tr><td>{p}</td><td>{s['deals']}</td><td>{s['pnl']:.2f}$</td><td>{avg:.3f}$</td></tr>"
 
+    status = "🟢 RUNNING" if STATE["engine_enabled"] else "🔴 STOPPED"
+
     return f"""
     <html>
     <head>
-        <title>GRID BOT — KILLER</title>
+        <title>GRID BOT — CONTROL</title>
         <style>
             body {{ background:#0f1116; color:#eee; font-family:Arial }}
+            button {{ padding:8px 14px; margin:4px }}
+            input {{ padding:6px }}
             table {{ border-collapse:collapse; width:100% }}
             td,th {{ border:1px solid #333; padding:6px }}
         </style>
     </head>
     <body>
-        <h2>🔥 GRID BOT — KILLER MODE</h2>
+        <h2>🤖 GRID BOT</h2>
+        <p><b>Status:</b> {status}</p>
+        <p><b>Server IP:</b> {STATE["public_ip"]}</p>
+
+        <form method="post" action="/start"><button>▶ START</button></form>
+        <form method="post" action="/stop"><button>⏹ STOP</button></form>
+
+        <form method="post" action="/deposit">
+            <input name="amount" type="number" step="1" value="{STATE["deposit"]}">
+            <button>💰 Update Deposit</button>
+        </form>
+
         <p>Uptime: {uptime} min</p>
         <p>Equity: {equity:.2f}$ | PnL: {STATE["total_pnl"]:.2f}$</p>
         <p>Deals: {STATE["deals"]}</p>
 
-        <h3>Активные пары</h3>
-        <p>Ручные: {", ".join(STATE["active_pairs"])}</p>
-        <p>Авто: {", ".join(STATE["auto_pairs"])}</p>
+        <h3>Pairs</h3>
+        <p>Manual: {", ".join(STATE["active_pairs"])}</p>
+        <p>Auto: {", ".join(STATE["auto_pairs"])}</p>
 
-        <h3>Статистика по парам</h3>
+        <h3>Stats</h3>
         <table>
             <tr><th>Pair</th><th>Deals</th><th>PnL</th><th>Avg</th></tr>
-            {rows or "<tr><td colspan=4>нет данных</td></tr>"}
+            {rows or "<tr><td colspan=4>no data</td></tr>"}
         </table>
     </body>
     </html>

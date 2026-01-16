@@ -1,5 +1,6 @@
+flask
+requests
 fastapi
 uvicorn
 aiohttp
-flask
-requests
+python-multipart

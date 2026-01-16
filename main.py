@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 import uvicorn
 
 # ================= CONFIG =================
-SYMBOL = "PEPEUSDT"
+SYMBOL = "1000PEPEUSDT"
 BASE_URL = "https://fapi.binance.com"
 
 ORDER_NOTIONAL = 5.0      # SAFE MODE
